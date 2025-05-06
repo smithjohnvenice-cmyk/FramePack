@@ -158,9 +158,9 @@ def video_encode(video_path, vae, height=640, width=640, vae_batch_size=16, devi
     
     return start_latent, input_image_np, history_latents, fps
 
-# 20250506 pftq: Modified worker to accept video input and FPS
+# 20250506 pftq: Modified worker to accept video input, FPS, and clean frame count
 @torch.no_grad()
-def worker(input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, fps):
+def worker(input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, fps, num_clean_frames):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -263,11 +263,39 @@ def worker(input_video, prompt, n_prompt, seed, total_second_length, latent_wind
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
 
-            indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
-            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
+            # 20250506 pftq: Use user-specified number of context frames, matching original allocation for num_clean_frames=2
+            available_frames = history_latents.shape[2]
+            # Adjust num_clean_frames to match original behavior: num_clean_frames=2 means 1 frame for clean_latents_1x
+            effective_clean_frames = max(0, num_clean_frames - 1) if num_clean_frames > 1 else 0
+            effective_clean_frames = min(effective_clean_frames, available_frames - 1) if available_frames > 1 else 0
+            num_2x_frames = min(2, max(0, available_frames - effective_clean_frames))  # Up to 2 frames for 2x
+            num_4x_frames = min(16, max(0, available_frames - effective_clean_frames - num_2x_frames))  # Remainder for 4x
+            total_context_frames = num_4x_frames + num_2x_frames + effective_clean_frames
+
+            indices = torch.arange(0, sum([1, num_4x_frames, num_2x_frames, effective_clean_frames, latent_window_size])).unsqueeze(0)
+            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split(
+                [1, num_4x_frames, num_2x_frames, effective_clean_frames, latent_window_size], dim=1
+            )
             clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
 
-            clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -sum([16, 2, 1]):, :, :].split([16, 2, 1], dim=2)
+            # 20250506 pftq: Split history_latents dynamically based on available frames
+            context_frames = history_latents[:, :, -total_context_frames:, :, :] if total_context_frames > 0 else history_latents[:, :, :0, :, :]
+            if total_context_frames > 0:
+                split_sizes = [num_4x_frames, num_2x_frames, effective_clean_frames]
+                split_sizes = [s for s in split_sizes if s > 0]  # Remove zero sizes
+                if split_sizes:
+                    splits = context_frames.split(split_sizes, dim=2)
+                    split_idx = 0
+                    clean_latents_4x = splits[split_idx] if num_4x_frames > 0 else history_latents[:, :, :0, :, :]
+                    split_idx += 1 if num_4x_frames > 0 else 0
+                    clean_latents_2x = splits[split_idx] if num_2x_frames > 0 and split_idx < len(splits) else history_latents[:, :, :0, :, :]
+                    split_idx += 1 if num_2x_frames > 0 else 0
+                    clean_latents_1x = splits[split_idx] if effective_clean_frames > 0 and split_idx < len(splits) else history_latents[:, :, :0, :, :]
+                else:
+                    clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :0, :, :]
+            else:
+                clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :0, :, :]
+
             clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
 
             generated_latents = sample_hunyuan(
@@ -279,7 +307,6 @@ def worker(input_video, prompt, n_prompt, seed, total_second_length, latent_wind
                 real_guidance_scale=cfg,
                 distilled_guidance_scale=gs,
                 guidance_rescale=rs,
-                # shift=3.0,
                 num_inference_steps=steps,
                 generator=rnd,
                 prompt_embeds=llama_vec,
@@ -341,8 +368,8 @@ def worker(input_video, prompt, n_prompt, seed, total_second_length, latent_wind
     stream.output_queue.push(('end', None))
     return
 
-# 20250506 pftq: Modified process to pass FPS from video_encode
-def process(input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf):
+# 20250506 pftq: Modified process to pass FPS and clean frame count from video_encode
+def process(input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, num_clean_frames):
     global stream
     # 20250506 pftq: Updated assertion for video input
     assert input_video is not None, 'No input video!'
@@ -355,8 +382,8 @@ def process(input_video, prompt, n_prompt, seed, total_second_length, latent_win
     vr = decord.VideoReader(input_video)
     fps = vr.get_avg_fps()
 
-    # 20250506 pftq: Pass FPS to worker
-    async_run(worker, input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, fps)
+    # 20250506 pftq: Pass FPS and num_clean_frames to worker
+    async_run(worker, input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, fps, num_clean_frames)
 
     output_filename = None
 
@@ -411,8 +438,12 @@ with block:
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
 
+                # 20250506 pftq: Renamed slider to Number of Context Frames and updated description
+                num_clean_frames = gr.Slider(label="Number of Context Frames", minimum=1, maximum=10, value=5, step=1, info="Retain more video details but increase memory use. Reduce to 2 if memory issues.")
+                
                 cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=False)  # Should not change
-                gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=10.0, step=0.01, info='Changing this value is not recommended.')
+                # 20250506 pftq: Reduced default distilled guidance scale to improve adherence to input video
+                gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=3.0, step=0.01, info='Prompt adherence at the cost of less details from the input video, but to a lesser extent than Context Frames.')
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
@@ -427,8 +458,8 @@ with block:
 
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
-    # 20250506 pftq: Updated inputs to use input_video
-    ips = [input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf]
+    # 20250506 pftq: Updated inputs to include num_clean_frames
+    ips = [input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, num_clean_frames]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
