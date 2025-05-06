@@ -102,7 +102,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 # 20250506 pftq: Added function to encode input video frames into latents
 @torch.no_grad()
-def video_encode(video_path, vae, height=640, width=640, vae_batch_size=4, device="cuda"):
+def video_encode(video_path, resolution, vae, vae_batch_size=4, device="cuda", width=None, height=None):
     """
     Encode a video into latent representations using the VAE.
     
@@ -141,11 +141,24 @@ def video_encode(video_path, vae, height=640, width=640, vae_batch_size=4, devic
         frames = vr.get_batch(range(num_frames)).asnumpy()  # Shape: (num_frames, height, width, channels)
         print(f"Frames read: {frames.shape}")
 
+        # 20250506 pftq: Get native video resolution
+        native_height, native_width = frames.shape[1], frames.shape[2]
+        print(f"Native video resolution: {native_width}x{native_height}")
+    
+        # 20250506 pftq: Use native resolution if height/width not specified, otherwise use provided values
+        target_height = native_height if height is None else height
+        target_width = native_width if width is None else width
+    
+        # 20250506 pftq: Adjust to nearest bucket for model compatibility
+        
+        target_height, target_width = find_nearest_bucket(target_height, target_width, resolution=resolution)
+        print(f"Adjusted resolution: {target_width}x{target_height}")
+
         # 20250506 pftq: Preprocess frames to match original image processing
         processed_frames = []
         for i, frame in enumerate(frames):
             #print(f"Preprocessing frame {i+1}/{num_frames}")
-            frame_np = resize_and_center_crop(frame, target_width=width, target_height=height)
+            frame_np = resize_and_center_crop(frame, target_width=target_width, target_height=target_height)
             processed_frames.append(frame_np)
         processed_frames = np.stack(processed_frames)  # Shape: (num_frames, height, width, channels)
         print(f"Frames preprocessed: {processed_frames.shape}")
@@ -211,7 +224,7 @@ def video_encode(video_path, vae, height=640, width=640, vae_batch_size=4, devic
             torch.cuda.empty_cache()
             print("VAE moved back to CPU, CUDA cache cleared")
 
-        return start_latent, input_image_np, history_latents, fps
+        return start_latent, input_image_np, history_latents, fps, target_height, target_width
 
     except Exception as e:
         print(f"Error in video_encode: {str(e)}")
@@ -219,7 +232,7 @@ def video_encode(video_path, vae, height=640, width=640, vae_batch_size=4, devic
 
 # 20250506 pftq: Modified worker to accept video input, FPS, and clean frame count
 @torch.no_grad()
-def worker(input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, fps, num_clean_frames):
+def worker(input_video, prompt, n_prompt, seed, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, fps, num_clean_frames):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -255,9 +268,10 @@ def worker(input_video, prompt, n_prompt, seed, total_second_length, latent_wind
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Video processing ...'))))
 
         # 20250506 pftq: Encode video
-        H, W = 640, 640  # Default resolution, will be adjusted
-        height, width = find_nearest_bucket(H, W, resolution=640)
-        start_latent, input_image_np, history_latents, fps = video_encode(input_video, vae, height, width, vae_batch_size=16, device=gpu)
+        #H, W = 640, 640  # Default resolution, will be adjusted
+        #height, width = find_nearest_bucket(H, W, resolution=640)
+        #start_latent, input_image_np, history_latents, fps = video_encode(input_video, vae, height, width, vae_batch_size=16, device=gpu)
+        start_latent, input_image_np, history_latents, fps, height, width = video_encode(input_video, resolution, vae, vae_batch_size=4, device=gpu)
 
         Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
 
@@ -428,7 +442,7 @@ def worker(input_video, prompt, n_prompt, seed, total_second_length, latent_wind
     return
 
 # 20250506 pftq: Modified process to pass FPS and clean frame count from video_encode
-def process(input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, num_clean_frames):
+def process(input_video, prompt, n_prompt, seed, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, num_clean_frames):
     global stream
     # 20250506 pftq: Updated assertion for video input
     assert input_video is not None, 'No input video!'
@@ -442,7 +456,7 @@ def process(input_video, prompt, n_prompt, seed, total_second_length, latent_win
     fps = vr.get_avg_fps()
 
     # 20250506 pftq: Pass FPS and num_clean_frames to worker
-    async_run(worker, input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, fps, num_clean_frames)
+    async_run(worker, input_video, prompt, n_prompt, seed, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, fps, num_clean_frames)
 
     output_filename = None
 
@@ -492,6 +506,8 @@ with block:
 
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
+                resolution = gr.Number(label="Resolution (max width or height)", value=640, precision=0, visible=False)
+
                 total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
@@ -519,7 +535,7 @@ with block:
     gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
 
     # 20250506 pftq: Updated inputs to include num_clean_frames
-    ips = [input_video, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, num_clean_frames]
+    ips = [input_video, prompt, n_prompt, seed, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf, num_clean_frames]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
