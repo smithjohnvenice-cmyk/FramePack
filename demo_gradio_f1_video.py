@@ -16,6 +16,8 @@ import math
 import decord
 # 20250506 pftq: Added for progress bars in video_encode
 from tqdm import tqdm
+# 20250506 pftq: Normalize file paths for Windows compatibility
+import pathlib
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -100,7 +102,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 # 20250506 pftq: Added function to encode input video frames into latents
 @torch.no_grad()
-def video_encode(video_path, vae, height=640, width=640, vae_batch_size=16, device="cuda"):
+def video_encode(video_path, vae, height=640, width=640, vae_batch_size=4, device="cuda"):
     """
     Encode a video into latent representations using the VAE.
     
@@ -117,46 +119,103 @@ def video_encode(video_path, vae, height=640, width=640, vae_batch_size=16, devi
         history_latents: Latents of all frames (shape: [1, channels, frames, height//8, width//8]).
         fps: Frames per second of the input video.
     """
-    # 20250506 pftq: Load video and get FPS
-    vr = decord.VideoReader(video_path)
-    fps = vr.get_avg_fps()  # Get input video FPS
-    frames = vr.get_batch(range(len(vr))).asnumpy()  # Shape: (num_frames, height, width, channels)
-    
-    # 20250506 pftq: Preprocess frames to match original image processing
-    processed_frames = []
-    for frame in frames:
-        frame_np = resize_and_center_crop(frame, target_width=width, target_height=height)
-        processed_frames.append(frame_np)
-    processed_frames = np.stack(processed_frames)  # Shape: (num_frames, height, width, channels)
-    
-    # 20250506 pftq: Save first frame for CLIP vision encoding
-    input_image_np = processed_frames[0]
-    
-    # 20250506 pftq: Convert to tensor and normalize to [-1, 1]
-    frames_pt = torch.from_numpy(processed_frames).float() / 127.5 - 1
-    frames_pt = frames_pt.permute(0, 3, 1, 2)  # Shape: (num_frames, channels, height, width)
-    frames_pt = frames_pt.unsqueeze(0)  # Shape: (1, num_frames, channels, height, width)
-    frames_pt = frames_pt.permute(0, 2, 1, 3, 4)  # Shape: (1, channels, num_frames, height, width)
-    
-    # 20250506 pftq: Move to device
-    frames_pt = frames_pt.to(device)
-    
-    # 20250506 pftq: Encode frames in batches
-    latents = []
-    vae.eval()
-    with torch.no_grad():
-        for i in tqdm(range(0, frames_pt.shape[2], vae_batch_size), desc="Encoding video frames"):
-            batch = frames_pt[:, :, i:i + vae_batch_size]  # Shape: (1, channels, batch_size, height, width)
-            batch_latent = vae_encode(batch, vae)
-            latents.append(batch_latent)
-    
-    # 20250506 pftq: Concatenate latents
-    history_latents = torch.cat(latents, dim=2)  # Shape: (1, channels, frames, height//8, width//8)
-    
-    # 20250506 pftq: Get first frame's latent
-    start_latent = history_latents[:, :, :1]  # Shape: (1, channels, 1, height//8, width//8)
-    
-    return start_latent, input_image_np, history_latents, fps
+    # 20250506 pftq: Normalize video path for Windows compatibility
+    video_path = str(pathlib.Path(video_path).resolve())
+    print(f"Processing video: {video_path}")
+
+    # 20250506 pftq: Check CUDA availability and fallback to CPU if needed
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA is not available, falling back to CPU")
+        device = "cpu"
+
+    try:
+        # 20250506 pftq: Load video and get FPS
+        print("Initializing VideoReader...")
+        vr = decord.VideoReader(video_path)
+        fps = vr.get_avg_fps()  # Get input video FPS
+        num_frames = len(vr)
+        print(f"Video loaded: {num_frames} frames, FPS: {fps}")
+
+        # 20250506 pftq: Read frames
+        print("Reading video frames...")
+        frames = vr.get_batch(range(num_frames)).asnumpy()  # Shape: (num_frames, height, width, channels)
+        print(f"Frames read: {frames.shape}")
+
+        # 20250506 pftq: Preprocess frames to match original image processing
+        processed_frames = []
+        for i, frame in enumerate(frames):
+            #print(f"Preprocessing frame {i+1}/{num_frames}")
+            frame_np = resize_and_center_crop(frame, target_width=width, target_height=height)
+            processed_frames.append(frame_np)
+        processed_frames = np.stack(processed_frames)  # Shape: (num_frames, height, width, channels)
+        print(f"Frames preprocessed: {processed_frames.shape}")
+
+        # 20250506 pftq: Save first frame for CLIP vision encoding
+        input_image_np = processed_frames[0]
+
+        # 20250506 pftq: Convert to tensor and normalize to [-1, 1]
+        print("Converting frames to tensor...")
+        frames_pt = torch.from_numpy(processed_frames).float() / 127.5 - 1
+        frames_pt = frames_pt.permute(0, 3, 1, 2)  # Shape: (num_frames, channels, height, width)
+        frames_pt = frames_pt.unsqueeze(0)  # Shape: (1, num_frames, channels, height, width)
+        frames_pt = frames_pt.permute(0, 2, 1, 3, 4)  # Shape: (1, channels, num_frames, height, width)
+        print(f"Tensor shape: {frames_pt.shape}")
+
+        # 20250506 pftq: Move to device
+        print(f"Moving tensor to device: {device}")
+        frames_pt = frames_pt.to(device)
+        print("Tensor moved to device")
+
+        # 20250506 pftq: Move VAE to device
+        print(f"Moving VAE to device: {device}")
+        vae.to(device)
+        print("VAE moved to device")
+
+        # 20250506 pftq: Encode frames in batches
+        latents = []
+        vae.eval()
+        with torch.no_grad():
+            for i in tqdm(range(0, frames_pt.shape[2], vae_batch_size), desc="Encoding video frames", mininterval=0.1):
+                #print(f"Encoding batch {i//vae_batch_size + 1}: frames {i} to {min(i + vae_batch_size, frames_pt.shape[2])}")
+                batch = frames_pt[:, :, i:i + vae_batch_size]  # Shape: (1, channels, batch_size, height, width)
+                try:
+                    # 20250506 pftq: Log GPU memory before encoding
+                    if device == "cuda":
+                        free_mem = torch.cuda.memory_allocated() / 1024**3
+                        #print(f"GPU memory before encoding: {free_mem:.2f} GB")
+                    batch_latent = vae_encode(batch, vae)
+                    # 20250506 pftq: Synchronize CUDA to catch issues
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                        #print(f"GPU memory after encoding: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                    latents.append(batch_latent)
+                    #print(f"Batch encoded, latent shape: {batch_latent.shape}")
+                except RuntimeError as e:
+                    print(f"Error during VAE encoding: {str(e)}")
+                    if device == "cuda" and "out of memory" in str(e).lower():
+                        print("CUDA out of memory, try reducing vae_batch_size or using CPU")
+                    raise
+
+        # 20250506 pftq: Concatenate latents
+        print("Concatenating latents...")
+        history_latents = torch.cat(latents, dim=2)  # Shape: (1, channels, frames, height//8, width//8)
+        print(f"History latents shape: {history_latents.shape}")
+
+        # 20250506 pftq: Get first frame's latent
+        start_latent = history_latents[:, :, :1]  # Shape: (1, channels, 1, height//8, width//8)
+        print(f"Start latent shape: {start_latent.shape}")
+
+        # 20250506 pftq: Move VAE back to CPU to free GPU memory
+        if device == "cuda":
+            vae.to(cpu)
+            torch.cuda.empty_cache()
+            print("VAE moved back to CPU, CUDA cache cleared")
+
+        return start_latent, input_image_np, history_latents, fps
+
+    except Exception as e:
+        print(f"Error in video_encode: {str(e)}")
+        raise
 
 # 20250506 pftq: Modified worker to accept video input, FPS, and clean frame count
 @torch.no_grad()
