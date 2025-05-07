@@ -18,6 +18,8 @@ import decord
 from tqdm import tqdm
 # 20250506 pftq: Normalize file paths for Windows compatibility
 import pathlib
+# 20250506 pftq: for easier to read timestamp
+from datetime import datetime
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -133,12 +135,19 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=4, devic
         print("Initializing VideoReader...")
         vr = decord.VideoReader(video_path)
         fps = vr.get_avg_fps()  # Get input video FPS
-        num_frames = len(vr)
-        print(f"Video loaded: {num_frames} frames, FPS: {fps}")
+        num_real_frames = len(vr)
+        print(f"Video loaded: {num_real_frames} frames, FPS: {fps}")
+
+        # Truncate to nearest latent size (multiple of 4)
+        latent_size_factor = 4
+        num_frames = (num_real_frames // latent_size_factor) * latent_size_factor
+        if num_frames != num_real_frames:
+            print(f"Truncating video from {num_real_frames} to {num_frames} frames for latent size compatibility")
+        num_real_frames = num_frames
 
         # 20250506 pftq: Read frames
         print("Reading video frames...")
-        frames = vr.get_batch(range(num_frames)).asnumpy()  # Shape: (num_frames, height, width, channels)
+        frames = vr.get_batch(range(num_real_frames)).asnumpy()  # Shape: (num_real_frames, height, width, channels)
         print(f"Frames read: {frames.shape}")
 
         # 20250506 pftq: Get native video resolution
@@ -162,7 +171,7 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=4, devic
             #print(f"Preprocessing frame {i+1}/{num_frames}")
             frame_np = resize_and_center_crop(frame, target_width=target_width, target_height=target_height)
             processed_frames.append(frame_np)
-        processed_frames = np.stack(processed_frames)  # Shape: (num_frames, height, width, channels)
+        processed_frames = np.stack(processed_frames)  # Shape: (num_real_frames, height, width, channels)
         print(f"Frames preprocessed: {processed_frames.shape}")
 
         # 20250506 pftq: Save first frame for CLIP vision encoding
@@ -171,10 +180,13 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=4, devic
         # 20250506 pftq: Convert to tensor and normalize to [-1, 1]
         print("Converting frames to tensor...")
         frames_pt = torch.from_numpy(processed_frames).float() / 127.5 - 1
-        frames_pt = frames_pt.permute(0, 3, 1, 2)  # Shape: (num_frames, channels, height, width)
-        frames_pt = frames_pt.unsqueeze(0)  # Shape: (1, num_frames, channels, height, width)
-        frames_pt = frames_pt.permute(0, 2, 1, 3, 4)  # Shape: (1, channels, num_frames, height, width)
+        frames_pt = frames_pt.permute(0, 3, 1, 2)  # Shape: (num_real_frames, channels, height, width)
+        frames_pt = frames_pt.unsqueeze(0)  # Shape: (1, num_real_frames, channels, height, width)
+        frames_pt = frames_pt.permute(0, 2, 1, 3, 4)  # Shape: (1, channels, num_real_frames, height, width)
         print(f"Tensor shape: {frames_pt.shape}")
+        
+        # 20250507 pftq: Save pixel frames for use in worker
+        input_video_pixels = frames_pt.cpu()
 
         # 20250506 pftq: Move to device
         print(f"Moving tensor to device: {device}")
@@ -210,7 +222,7 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=4, devic
                     if device == "cuda" and "out of memory" in str(e).lower():
                         print("CUDA out of memory, try reducing vae_batch_size or using CPU")
                     raise
-
+        
         # 20250506 pftq: Concatenate latents
         print("Concatenating latents...")
         history_latents = torch.cat(latents, dim=2)  # Shape: (1, channels, frames, height//8, width//8)
@@ -226,7 +238,7 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=4, devic
             torch.cuda.empty_cache()
             print("VAE moved back to CPU, CUDA cache cleared")
 
-        return start_latent, input_image_np, history_latents, fps, target_height, target_width
+        return start_latent, input_image_np, history_latents, fps, target_height, target_width, input_video_pixels
 
     except Exception as e:
         print(f"Error in video_encode: {str(e)}")
@@ -234,12 +246,10 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=4, devic
 
 # 20250506 pftq: Modified worker to accept video input, FPS, and clean frame count
 @torch.no_grad()
-def worker(input_video, prompt, n_prompt, seed, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames):
+def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
-
-    job_id = generate_timestamp()
-
+    
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
     try:
@@ -273,9 +283,11 @@ def worker(input_video, prompt, n_prompt, seed, resolution, total_second_length,
         #H, W = 640, 640  # Default resolution, will be adjusted
         #height, width = find_nearest_bucket(H, W, resolution=640)
         #start_latent, input_image_np, history_latents, fps = video_encode(input_video, vae, height, width, vae_batch_size=16, device=gpu)
-        start_latent, input_image_np, history_latents, fps, height, width = video_encode(input_video, resolution, no_resize, vae, vae_batch_size=4, device=gpu)
+        start_latent, input_image_np, video_latents, fps, height, width, input_video_pixels  = video_encode(input_video, resolution, no_resize, vae, vae_batch_size=4, device=gpu)
 
-        Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png'))
+        #save_bcthw_as_mp4(vae_decode(video_latents, vae).cpu(), os.path.join(outputs_folder, f'{job_id}_input_video.mp4'), fps=fps, crf=mp4_crf) # 20250507 pftq: first 16 frames corrupted by vae encoding, check later
+
+        #Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png')) 
 
         # CLIP Vision
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'CLIP Vision encoding ...'))))
@@ -293,145 +305,174 @@ def worker(input_video, prompt, n_prompt, seed, resolution, total_second_length,
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
-        # Sampling
-        stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
-
-        rnd = torch.Generator("cpu").manual_seed(seed)
-
-        # 20250506 pftq: Initialize history_latents with video latents
-        history_latents = history_latents.cpu()
-        total_generated_latent_frames = history_latents.shape[2]
-        # 20250506 pftq: Initialize history_pixels to fix UnboundLocalError
-        history_pixels = None
-
-        for section_index in range(total_latent_sections):
-            if stream.input_queue.top() == 'end':
-                stream.output_queue.push(('end', None))
-                return
-
-            print(f'section_index = {section_index}, total_latent_sections = {total_latent_sections}')
-
-            if not high_vram:
-                unload_complete_models()
-                move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
-
-            if use_teacache:
-                transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
-            else:
-                transformer.initialize_teacache(enable_teacache=False)
-
-            def callback(d):
-                preview = d['denoised']
-                preview = vae_decode_fake(preview)
-
-                preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
-                preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
-
+        for idx in range(batch):
+            if idx>0:
+                seed = seed + 1
+            
+            if batch > 1:
+                print(f"Beginning video {idx+1} of {batch} with seed {seed} ")
+            
+            #job_id = generate_timestamp()
+            job_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")+f"_framepackf1-videoinput_seed-{seed}" # 20250506 pftq: easier to read timestamp and filename
+            
+            # Sampling
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
+    
+            rnd = torch.Generator("cpu").manual_seed(seed)
+    
+            # 20250506 pftq: Initialize history_latents with video latents
+            history_latents = video_latents.cpu()
+            total_generated_latent_frames = history_latents.shape[2]
+            # 20250506 pftq: Initialize history_pixels to fix UnboundLocalError
+            history_pixels = None
+            previous_video = None
+            
+            # 20250507 pftq: hot fix for initial video being corrupted by vae encoding
+            history_pixels = input_video_pixels 
+            
+            for section_index in range(total_latent_sections):
                 if stream.input_queue.top() == 'end':
                     stream.output_queue.push(('end', None))
-                    raise KeyboardInterrupt('User ends the task.')
-
-                current_step = d['i'] + 1
-                percentage = int(100.0 * current_step / steps)
-                hint = f'Sampling {current_step}/{steps}'
-                desc = f'Total generated frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-{fps}). The video is being extended now ...'
-                stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
-                return
-
-            # 20250506 pftq: Use user-specified number of context frames, matching original allocation for num_clean_frames=2
-            available_frames = history_latents.shape[2]
-            # Adjust num_clean_frames to match original behavior: num_clean_frames=2 means 1 frame for clean_latents_1x
-            effective_clean_frames = max(0, num_clean_frames - 1) if num_clean_frames > 1 else 0
-            effective_clean_frames = min(effective_clean_frames, available_frames - 1) if available_frames > 1 else 0
-            num_2x_frames = min(2, max(0, available_frames - effective_clean_frames))  # Up to 2 frames for 2x
-            num_4x_frames = min(16, max(0, available_frames - effective_clean_frames - num_2x_frames))  # Remainder for 4x
-            total_context_frames = num_4x_frames + num_2x_frames + effective_clean_frames
-
-            indices = torch.arange(0, sum([1, num_4x_frames, num_2x_frames, effective_clean_frames, latent_window_size])).unsqueeze(0)
-            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split(
-                [1, num_4x_frames, num_2x_frames, effective_clean_frames, latent_window_size], dim=1
-            )
-            clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
-
-            # 20250506 pftq: Split history_latents dynamically based on available frames
-            context_frames = history_latents[:, :, -total_context_frames:, :, :] if total_context_frames > 0 else history_latents[:, :, :0, :, :]
-            if total_context_frames > 0:
-                split_sizes = [num_4x_frames, num_2x_frames, effective_clean_frames]
-                split_sizes = [s for s in split_sizes if s > 0]  # Remove zero sizes
-                if split_sizes:
-                    splits = context_frames.split(split_sizes, dim=2)
-                    split_idx = 0
-                    clean_latents_4x = splits[split_idx] if num_4x_frames > 0 else history_latents[:, :, :0, :, :]
-                    split_idx += 1 if num_4x_frames > 0 else 0
-                    clean_latents_2x = splits[split_idx] if num_2x_frames > 0 and split_idx < len(splits) else history_latents[:, :, :0, :, :]
-                    split_idx += 1 if num_2x_frames > 0 else 0
-                    clean_latents_1x = splits[split_idx] if effective_clean_frames > 0 and split_idx < len(splits) else history_latents[:, :, :0, :, :]
+                    return
+    
+                print(f'section_index = {section_index}, total_latent_sections = {total_latent_sections}')
+    
+                if not high_vram:
+                    unload_complete_models()
+                    move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
+    
+                if use_teacache:
+                    transformer.initialize_teacache(enable_teacache=True, num_steps=steps)
+                else:
+                    transformer.initialize_teacache(enable_teacache=False)
+    
+                def callback(d):
+                    preview = d['denoised']
+                    preview = vae_decode_fake(preview)
+    
+                    preview = (preview * 255.0).detach().cpu().numpy().clip(0, 255).astype(np.uint8)
+                    preview = einops.rearrange(preview, 'b c t h w -> (b h) (t w) c')
+    
+                    if stream.input_queue.top() == 'end':
+                        stream.output_queue.push(('end', None))
+                        raise KeyboardInterrupt('User ends the task.')
+    
+                    current_step = d['i'] + 1
+                    percentage = int(100.0 * current_step / steps)
+                    hint = f'Sampling {current_step}/{steps}'
+                    desc = f'Total frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-{fps}), Seed: {seed}, Video {idx+1} of {batch}. The video is generating...'
+                    stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
+                    return
+    
+                # 20250506 pftq: Use user-specified number of context frames, matching original allocation for num_clean_frames=2
+                available_frames = history_latents.shape[2]
+                # Adjust num_clean_frames to match original behavior: num_clean_frames=2 means 1 frame for clean_latents_1x
+                effective_clean_frames = max(0, num_clean_frames - 1) if num_clean_frames > 1 else 0
+                effective_clean_frames = min(effective_clean_frames, available_frames - 1) if available_frames > 1 else 0
+                num_2x_frames = min(2, max(0, available_frames - effective_clean_frames))  # Up to 2 frames for 2x
+                num_4x_frames = min(16, max(0, available_frames - effective_clean_frames - num_2x_frames))  # Remainder for 4x
+                total_context_frames = num_4x_frames + num_2x_frames + effective_clean_frames
+    
+                indices = torch.arange(0, sum([1, num_4x_frames, num_2x_frames, effective_clean_frames, latent_window_size])).unsqueeze(0)
+                clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split(
+                    [1, num_4x_frames, num_2x_frames, effective_clean_frames, latent_window_size], dim=1
+                )
+                clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
+    
+                # 20250506 pftq: Split history_latents dynamically based on available frames
+                context_frames = history_latents[:, :, -total_context_frames:, :, :] if total_context_frames > 0 else history_latents[:, :, :0, :, :]
+                if total_context_frames > 0:
+                    split_sizes = [num_4x_frames, num_2x_frames, effective_clean_frames]
+                    split_sizes = [s for s in split_sizes if s > 0]  # Remove zero sizes
+                    if split_sizes:
+                        splits = context_frames.split(split_sizes, dim=2)
+                        split_idx = 0
+                        clean_latents_4x = splits[split_idx] if num_4x_frames > 0 else history_latents[:, :, :0, :, :]
+                        split_idx += 1 if num_4x_frames > 0 else 0
+                        clean_latents_2x = splits[split_idx] if num_2x_frames > 0 and split_idx < len(splits) else history_latents[:, :, :0, :, :]
+                        split_idx += 1 if num_2x_frames > 0 else 0
+                        clean_latents_1x = splits[split_idx] if effective_clean_frames > 0 and split_idx < len(splits) else history_latents[:, :, :0, :, :]
+                    else:
+                        clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :0, :, :]
                 else:
                     clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :0, :, :]
-            else:
-                clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :0, :, :]
+    
+                clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
+    
+                generated_latents = sample_hunyuan(
+                    transformer=transformer,
+                    sampler='unipc',
+                    width=width,
+                    height=height,
+                    frames=latent_window_size * 4 - 3,
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=gs,
+                    guidance_rescale=rs,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=gpu,
+                    dtype=torch.bfloat16,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
+    
+                total_generated_latent_frames += int(generated_latents.shape[2])
+                history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
+    
+                if not high_vram:
+                    offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
+                    load_model_as_complete(vae, target_device=gpu)
+    
+                real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
+    
+                if history_pixels is None:
+                    history_pixels = vae_decode(real_history_latents, vae).cpu()
+                else:
+                  section_latent_frames = latent_window_size * 2
+                  overlapped_frames = latent_window_size * 4 - 3
+                  
+                  if section_index == 0: 
+                    extra_latents = 1  # Add up to 2 extra latent frames for smoother overlap to initial video
+                    extra_pixel_frames = extra_latents * 4  # Approx. 4 pixel frames per latent
+                    overlapped_frames = min(overlapped_frames + extra_pixel_frames, history_pixels.shape[2], section_latent_frames * 4)
 
-            clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
-
-            generated_latents = sample_hunyuan(
-                transformer=transformer,
-                sampler='unipc',
-                width=width,
-                height=height,
-                frames=latent_window_size * 4 - 3,
-                real_guidance_scale=cfg,
-                distilled_guidance_scale=gs,
-                guidance_rescale=rs,
-                num_inference_steps=steps,
-                generator=rnd,
-                prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
-                prompt_poolers=clip_l_pooler,
-                negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
-                negative_prompt_poolers=clip_l_pooler_n,
-                device=gpu,
-                dtype=torch.bfloat16,
-                image_embeddings=image_encoder_last_hidden_state,
-                latent_indices=latent_indices,
-                clean_latents=clean_latents,
-                clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=clean_latents_2x,
-                clean_latent_2x_indices=clean_latent_2x_indices,
-                clean_latents_4x=clean_latents_4x,
-                clean_latent_4x_indices=clean_latent_4x_indices,
-                callback=callback,
-            )
-
-            total_generated_latent_frames += int(generated_latents.shape[2])
-            history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
-
-            if not high_vram:
-                offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                load_model_as_complete(vae, target_device=gpu)
-
-            real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
-
-            if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
-            else:
-                section_latent_frames = latent_window_size * 2
-                overlapped_frames = latent_window_size * 4 - 3
-
-                current_pixels = vae_decode(real_history_latents[:, :, -section_latent_frames:], vae).cpu()
-                history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
-
-            if not high_vram:
-                unload_complete_models()
-
-            output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
-
-            # 20250506 pftq: Use input video FPS for output
-            save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, crf=mp4_crf)
-
-            print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
-
-            stream.output_queue.push(('file', output_filename))
+                  current_pixels = vae_decode(real_history_latents[:, :, -section_latent_frames:], vae).cpu()
+                  history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
+    
+                if not high_vram:
+                    unload_complete_models()
+    
+                output_filename = os.path.join(outputs_folder, f'{job_id}_{total_generated_latent_frames}.mp4')
+    
+                # 20250506 pftq: Use input video FPS for output
+                save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, crf=mp4_crf)
+                print(f"Latest video saved: {output_filename}")
+    
+                # 20250506 pftq: Clean up previous partial files
+                if previous_video is not None:
+                    try:
+                        os.remove(previous_video)
+                        print(f"Previous partial video deleted: {previous_video}")
+                    except Exception as e:
+                        print(f"Error deleting previous partial video {previous_video}: {e}")
+                previous_video = output_filename
+    
+                print(f'Decoded. Current latent shape {real_history_latents.shape}; pixel shape {history_pixels.shape}')
+    
+                stream.output_queue.push(('file', output_filename))
     except:
         traceback.print_exc()
 
@@ -444,7 +485,7 @@ def worker(input_video, prompt, n_prompt, seed, resolution, total_second_length,
     return
 
 # 20250506 pftq: Modified process to pass FPS and clean frame count from video_encode
-def process(input_video, prompt, n_prompt, seed, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames):
+def process(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames):
     global stream
     # 20250506 pftq: Updated assertion for video input
     assert input_video is not None, 'No input video!'
@@ -458,7 +499,7 @@ def process(input_video, prompt, n_prompt, seed, resolution, total_second_length
     fps = vr.get_avg_fps()
 
     # 20250506 pftq: Pass FPS and num_clean_frames to worker
-    async_run(worker, input_video, prompt, n_prompt, seed, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames)
+    async_run(worker, input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames)
 
     output_filename = None
 
@@ -471,7 +512,8 @@ def process(input_video, prompt, n_prompt, seed, resolution, total_second_length
 
         if flag == 'progress':
             preview, desc, html = data
-            yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
+            #yield gr.update(), gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True)
+            yield output_filename, gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True) # 20250506 pftq: Keep refreshing the video in case it got hidden when the tab was in the background
 
         if flag == 'end':
             yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
@@ -510,9 +552,11 @@ with block:
 
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
+                batch = gr.Slider(label="Batch Size (Number of Videos)", minimum=1, maximum=1000, value=1, step=1, info='Generate multiple videos each with a different seed.')
+
                 resolution = gr.Number(label="Resolution (max width or height)", value=640, precision=0, visible=False)
 
-                total_second_length = gr.Slider(label="Total Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
+                total_second_length = gr.Slider(label="Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
 
@@ -536,10 +580,12 @@ with block:
             progress_desc = gr.Markdown('', elem_classes='no-generating-animation')
             progress_bar = gr.HTML('', elem_classes='no-generating-animation')
 
-    gr.HTML('<div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>')
+    gr.HTML("""
+        <div style="text-align:center; margin-top:20px;">Share your results and find ideas at the <a href="https://x.com/search?q=framepack&f=live" target="_blank">FramePack Twitter (X) thread</a></div>
+    """)
 
     # 20250506 pftq: Updated inputs to include num_clean_frames
-    ips = [input_video, prompt, n_prompt, seed, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames]
+    ips = [input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
