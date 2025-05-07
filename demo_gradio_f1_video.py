@@ -199,7 +199,7 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, devi
         print("VAE moved to device")
 
         # 20250506 pftq: Encode frames in batches
-        print(f"Encoding input video frames in VAE batch size {vae_batch_size} (reduce if VRAM issues)")
+        print(f"Encoding input video frames in VAE batch size {vae_batch_size} (reduce if VRAM issues or forcing larger video resolution)")
         latents = []
         vae.eval()
         with torch.no_grad():
@@ -538,17 +538,17 @@ with block:
             # 20250506 pftq: Changed to Video input from Image
             input_video = gr.Video(sources='upload', label="Input Video", height=320)
             prompt = gr.Textbox(label="Prompt", value='')
-            example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
-            example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
+            #example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Quick List', samples_per_page=1000, components=[prompt])
+            #example_quick_prompts.click(lambda x: x[0], inputs=[example_quick_prompts], outputs=prompt, show_progress=False, queue=False)
 
             with gr.Row():
                 start_button = gr.Button(value="Start Generation")
                 end_button = gr.Button(value="End Generation", interactive=False)
 
             with gr.Group():
-                use_teacache = gr.Checkbox(label='Use TeaCache', value=False, info='Faster speed, but often makes hands and fingers slightly worse.')
-
-                no_resize = gr.Checkbox(label='Force Original Video Resolution (No Resizing)', value=False, info='Might lower quality if outside of training data. Might run out of VRAM if too large (720p requires > 24GB VRAM).')
+                with gr.Row():
+                    use_teacache = gr.Checkbox(label='Use TeaCache', value=False, info='Faster speed, but often makes hands and fingers slightly worse.')
+                    no_resize = gr.Checkbox(label='Force Original Video Resolution (No Resizing)', value=False, info='Might run out of VRAM (720p requires > 24GB VRAM).')
 
                 seed = gr.Number(label="Seed", value=31337, precision=0)
 
@@ -572,7 +572,7 @@ with block:
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
                 
-                vae_batch = gr.Slider(label="VAE Batch Size for Input Video", minimum=4, maximum=128, value=64, step=4, info="Reduce if running out of memory. Increase for better quality of frames from input video.")
+                vae_batch = gr.Slider(label="VAE Batch Size for Input Video", minimum=4, maximum=128, value=32, step=4, info="Reduce if running out of memory. Increase for better quality of frames from input video.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
