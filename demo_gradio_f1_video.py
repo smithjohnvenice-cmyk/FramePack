@@ -104,7 +104,7 @@ os.makedirs(outputs_folder, exist_ok=True)
 
 # 20250506 pftq: Added function to encode input video frames into latents
 @torch.no_grad()
-def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=4, device="cuda", width=None, height=None):
+def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, device="cuda", width=None, height=None):
     """
     Encode a video into latent representations using the VAE.
     
@@ -283,9 +283,7 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
         #H, W = 640, 640  # Default resolution, will be adjusted
         #height, width = find_nearest_bucket(H, W, resolution=640)
         #start_latent, input_image_np, history_latents, fps = video_encode(input_video, vae, height, width, vae_batch_size=16, device=gpu)
-        start_latent, input_image_np, video_latents, fps, height, width, input_video_pixels  = video_encode(input_video, resolution, no_resize, vae, vae_batch_size=4, device=gpu)
-
-        #save_bcthw_as_mp4(vae_decode(video_latents, vae).cpu(), os.path.join(outputs_folder, f'{job_id}_input_video.mp4'), fps=fps, crf=mp4_crf) # 20250507 pftq: first 16 frames corrupted by vae encoding, check later
+        start_latent, input_image_np, video_latents, fps, height, width, input_video_pixels  = video_encode(input_video, resolution, no_resize, vae, vae_batch_size=16, device=gpu)
 
         #Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png')) 
 
@@ -327,8 +325,9 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
             history_pixels = None
             previous_video = None
             
-            # 20250507 pftq: hot fix for initial video being corrupted by vae encoding
-            history_pixels = input_video_pixels 
+            # 20250507 pftq: hot fix for initial video being corrupted by vae encoding, issue with ghosting because of slight differences
+            #history_pixels = input_video_pixels 
+            #save_bcthw_as_mp4(vae_decode(video_latents, vae).cpu(), os.path.join(outputs_folder, f'{job_id}_input_video.mp4'), fps=fps, crf=mp4_crf) # 20250507 pftq: test fast movement corrupted by vae encoding if vae batch size too low
             
             for section_index in range(total_latent_sections):
                 if stream.input_queue.top() == 'end':
@@ -444,10 +443,10 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
                   section_latent_frames = latent_window_size * 2
                   overlapped_frames = latent_window_size * 4 - 3
                   
-                  if section_index == 0: 
-                    extra_latents = 1  # Add up to 2 extra latent frames for smoother overlap to initial video
-                    extra_pixel_frames = extra_latents * 4  # Approx. 4 pixel frames per latent
-                    overlapped_frames = min(overlapped_frames + extra_pixel_frames, history_pixels.shape[2], section_latent_frames * 4)
+                  #if section_index == 0: 
+                    #extra_latents = 2  # Add up to 2 extra latent frames for smoother overlap to initial video
+                    #extra_pixel_frames = extra_latents * 4  # Approx. 4 pixel frames per latent
+                    #overlapped_frames = min(overlapped_frames + extra_pixel_frames, history_pixels.shape[2], section_latent_frames * 4)
 
                   current_pixels = vae_decode(real_history_latents[:, :, -section_latent_frames:], vae).cpu()
                   history_pixels = soft_append_bcthw(history_pixels, current_pixels, overlapped_frames)
