@@ -199,6 +199,7 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, devi
         print("VAE moved to device")
 
         # 20250506 pftq: Encode frames in batches
+        print(f"Encoding input video frames in VAE batch size {vae_batch_size} (reduce if VRAM issues)")
         latents = []
         vae.eval()
         with torch.no_grad():
@@ -246,7 +247,7 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, devi
 
 # 20250506 pftq: Modified worker to accept video input, FPS, and clean frame count
 @torch.no_grad()
-def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames):
+def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames, vae_batch):
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
     
@@ -283,7 +284,7 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
         #H, W = 640, 640  # Default resolution, will be adjusted
         #height, width = find_nearest_bucket(H, W, resolution=640)
         #start_latent, input_image_np, history_latents, fps = video_encode(input_video, vae, height, width, vae_batch_size=16, device=gpu)
-        start_latent, input_image_np, video_latents, fps, height, width, input_video_pixels  = video_encode(input_video, resolution, no_resize, vae, vae_batch_size=16, device=gpu)
+        start_latent, input_image_np, video_latents, fps, height, width, input_video_pixels  = video_encode(input_video, resolution, no_resize, vae, vae_batch_size=vae_batch, device=gpu)
 
         #Image.fromarray(input_image_np).save(os.path.join(outputs_folder, f'{job_id}.png')) 
 
@@ -484,7 +485,7 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
     return
 
 # 20250506 pftq: Modified process to pass FPS and clean frame count from video_encode
-def process(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames):
+def process(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames, vae_batch):
     global stream
     # 20250506 pftq: Updated assertion for video input
     assert input_video is not None, 'No input video!'
@@ -498,7 +499,7 @@ def process(input_video, prompt, n_prompt, seed, batch, resolution, total_second
     fps = vr.get_avg_fps()
 
     # 20250506 pftq: Pass FPS and num_clean_frames to worker
-    async_run(worker, input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames)
+    async_run(worker, input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames, vae_batch)
 
     output_filename = None
 
@@ -570,6 +571,8 @@ with block:
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True, info='Requires using normal CFG (undistilled) instead of Distilled (set Distilled=1 and CFG > 1).') 
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                
+                vae_batch = gr.Slider(label="VAE Batch Size for Input Video", minimum=4, maximum=128, value=64, step=4, info="Reduce if running out of memory. Increase for better quality of frames from input video.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
@@ -584,7 +587,7 @@ with block:
     """)
 
     # 20250506 pftq: Updated inputs to include num_clean_frames
-    ips = [input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames]
+    ips = [input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames, vae_batch]
     start_button.click(fn=process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button])
     end_button.click(fn=end_process)
 
