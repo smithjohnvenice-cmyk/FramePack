@@ -199,7 +199,7 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, devi
         print("VAE moved to device")
 
         # 20250506 pftq: Encode frames in batches
-        print(f"Encoding input video frames in VAE batch size {vae_batch_size} (reduce if VRAM issues or forcing larger video resolution)")
+        print(f"Encoding input video frames in VAE batch size {vae_batch_size} (reduce if memory issues here or if forcing video resolution)")
         latents = []
         vae.eval()
         with torch.no_grad():
@@ -245,11 +245,9 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, devi
         print(f"Error in video_encode: {str(e)}")
         raise
 
-# 20250506 pftq: Modified worker to accept video input, FPS, and clean frame count
+# 20250506 pftq: Modified worker to accept video input and clean frame count
 @torch.no_grad()
-def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames, vae_batch):
-    total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
-    total_latent_sections = int(max(round(total_latent_sections), 1))
+def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames, vae_batch):
     
     stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Starting ...'))))
 
@@ -304,6 +302,9 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
+        total_latent_sections = (total_second_length * fps) / (latent_window_size * 4)
+        total_latent_sections = int(max(round(total_latent_sections), 1))
+
         for idx in range(batch):
             if idx>0:
                 seed = seed + 1
@@ -312,7 +313,7 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
                 print(f"Beginning video {idx+1} of {batch} with seed {seed} ")
             
             #job_id = generate_timestamp()
-            job_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")+f"_framepackf1-videoinput_seed-{seed}" # 20250506 pftq: easier to read timestamp and filename
+            job_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")+f"_framepackf1-videoinput_{width}-{total_second_length}sec_seed-{seed}_steps-{steps}_distilled-{gs}_cfg-{cfg}" # 20250506 pftq: easier to read timestamp and filename
             
             # Sampling
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
@@ -360,51 +361,63 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
                     current_step = d['i'] + 1
                     percentage = int(100.0 * current_step / steps)
                     hint = f'Sampling {current_step}/{steps}'
-                    desc = f'Total frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / 30) :.2f} seconds (FPS-{fps}), Seed: {seed}, Video {idx+1} of {batch}. The video is generating...'
+                    desc = f'Total frames: {int(max(0, total_generated_latent_frames * 4 - 3))}, Video length: {max(0, (total_generated_latent_frames * 4 - 3) / fps) :.2f} seconds (FPS-{fps}), Seed: {seed}, Video {idx+1} of {batch}. The video is generating part {section_index+1} of {total_latent_sections}...'
                     stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                     return
     
                 # 20250506 pftq: Use user-specified number of context frames, matching original allocation for num_clean_frames=2
-                available_frames = history_latents.shape[2]
+                available_frames = history_latents.shape[2]  # Number of latent frames
+                max_pixel_frames = min(latent_window_size * 4 - 3, available_frames * 4)  # Cap at available pixel frames
+                adjusted_latent_frames = max(1, (max_pixel_frames + 3) // 4)  # Convert back to latent frames
                 # Adjust num_clean_frames to match original behavior: num_clean_frames=2 means 1 frame for clean_latents_1x
                 effective_clean_frames = max(0, num_clean_frames - 1) if num_clean_frames > 1 else 0
-                effective_clean_frames = min(effective_clean_frames, available_frames - 1) if available_frames > 1 else 0
-                num_2x_frames = min(2, max(0, available_frames - effective_clean_frames))  # Up to 2 frames for 2x
-                num_4x_frames = min(16, max(0, available_frames - effective_clean_frames - num_2x_frames))  # Remainder for 4x
+                effective_clean_frames = min(effective_clean_frames, available_frames - 2) if available_frames > 2 else 0 # 20250507 pftq: changed 1 to 2 for edge case for <=1 sec videos
+                num_2x_frames = min(2, max(1, available_frames - effective_clean_frames - 1)) if available_frames > effective_clean_frames + 1 else 0 # 20250507 pftq: subtracted 1 for edge case for <=1 sec videos
+                num_4x_frames = min(16, max(1, available_frames - effective_clean_frames - num_2x_frames)) if available_frames > effective_clean_frames + num_2x_frames else 0 # 20250507 pftq: Edge case for <=1 sec
+                
                 total_context_frames = num_4x_frames + num_2x_frames + effective_clean_frames
-    
-                indices = torch.arange(0, sum([1, num_4x_frames, num_2x_frames, effective_clean_frames, latent_window_size])).unsqueeze(0)
+                total_context_frames = min(total_context_frames, available_frames)  # 20250507 pftq: Edge case for <=1 sec videos
+
+                indices = torch.arange(0, sum([1, num_4x_frames, num_2x_frames, effective_clean_frames, adjusted_latent_frames])).unsqueeze(0) # 20250507 pftq: latent_window_size to adjusted_latent_frames for edge case for <=1 sec videos
                 clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split(
-                    [1, num_4x_frames, num_2x_frames, effective_clean_frames, latent_window_size], dim=1
+                    [1, num_4x_frames, num_2x_frames, effective_clean_frames, adjusted_latent_frames], dim=1 # 20250507 pftq: latent_window_size to adjusted_latent_frames for edge case for <=1 sec videos
                 )
                 clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
     
                 # 20250506 pftq: Split history_latents dynamically based on available frames
-                context_frames = history_latents[:, :, -total_context_frames:, :, :] if total_context_frames > 0 else history_latents[:, :, :0, :, :]
+                fallback_frame_count = 2 # 20250507 pftq: Changed 0 to 2 Edge case for <=1 sec videos
+                context_frames = history_latents[:, :, -total_context_frames:, :, :] if total_context_frames > 0 else history_latents[:, :, :fallback_frame_count, :, :]  
                 if total_context_frames > 0:
-                    split_sizes = [num_4x_frames, num_2x_frames, effective_clean_frames]
+                    split_sizes = [num_4x_frames, num_2x_frames, effective_clean_frames] 
                     split_sizes = [s for s in split_sizes if s > 0]  # Remove zero sizes
                     if split_sizes:
                         splits = context_frames.split(split_sizes, dim=2)
                         split_idx = 0
-                        clean_latents_4x = splits[split_idx] if num_4x_frames > 0 else history_latents[:, :, :0, :, :]
+                        clean_latents_4x = splits[split_idx] if num_4x_frames > 0 else history_latents[:, :, :fallback_frame_count, :, :]
+                        if clean_latents_4x.shape[2] < 2:  # 20250507 pftq: edge case for <=1 sec videos
+                            clean_latents_4x = torch.cat([clean_latents_4x, clean_latents_4x[:, :, -1:, :, :]], dim=2)[:, :, :2, :, :]
                         split_idx += 1 if num_4x_frames > 0 else 0
-                        clean_latents_2x = splits[split_idx] if num_2x_frames > 0 and split_idx < len(splits) else history_latents[:, :, :0, :, :]
+                        clean_latents_2x = splits[split_idx] if num_2x_frames > 0 and split_idx < len(splits) else history_latents[:, :, :fallback_frame_count, :, :]
+                        if clean_latents_2x.shape[2] < 2:  # 20250507 pftq: edge case for <=1 sec videos
+                            clean_latents_2x = torch.cat([clean_latents_2x, clean_latents_2x[:, :, -1:, :, :]], dim=2)[:, :, :2, :, :]
                         split_idx += 1 if num_2x_frames > 0 else 0
-                        clean_latents_1x = splits[split_idx] if effective_clean_frames > 0 and split_idx < len(splits) else history_latents[:, :, :0, :, :]
+                        clean_latents_1x = splits[split_idx] if effective_clean_frames > 0 and split_idx < len(splits) else history_latents[:, :, :fallback_frame_count, :, :] 
                     else:
-                        clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :0, :, :]
+                        clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :fallback_frame_count, :, :] 
                 else:
-                    clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :0, :, :]
+                    clean_latents_4x = clean_latents_2x = clean_latents_1x = history_latents[:, :, :fallback_frame_count, :, :] 
     
                 clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
-    
+
+                # 20250507 pftq: Fix for <=1 sec videos.
+                max_frames = min(latent_window_size * 4 - 3, history_latents.shape[2] * 4)
+
                 generated_latents = sample_hunyuan(
                     transformer=transformer,
                     sampler='unipc',
                     width=width,
                     height=height,
-                    frames=latent_window_size * 4 - 3,
+                    frames=max_frames,
                     real_guidance_scale=cfg,
                     distilled_guidance_scale=gs,
                     guidance_rescale=rs,
@@ -445,7 +458,7 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
                   overlapped_frames = latent_window_size * 4 - 3
                   
                   #if section_index == 0: 
-                    #extra_latents = 2  # Add up to 2 extra latent frames for smoother overlap to initial video
+                    #extra_latents = 1  # Add up to 2 extra latent frames for smoother overlap to initial video
                     #extra_pixel_frames = extra_latents * 4  # Approx. 4 pixel frames per latent
                     #overlapped_frames = min(overlapped_frames + extra_pixel_frames, history_pixels.shape[2], section_latent_frames * 4)
 
@@ -484,22 +497,31 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
     stream.output_queue.push(('end', None))
     return
 
-# 20250506 pftq: Modified process to pass FPS and clean frame count from video_encode
+# 20250506 pftq: Modified process to pass clean frame count, etc from video_encode
 def process(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames, vae_batch):
-    global stream
+    global stream, high_vram
     # 20250506 pftq: Updated assertion for video input
     assert input_video is not None, 'No input video!'
 
     yield None, None, '', '', gr.update(interactive=False), gr.update(interactive=True)
 
+    # 20250507 pftq: Even the H100 needs offloading if the video dimensions are 720p or higher
+    if high_vram and (no_resize or resolution>640):
+        print("Disabling high vram mode due to no resize and/or potentially higher resolution...")
+        high_vram = False
+        vae.enable_slicing()
+        vae.enable_tiling()
+        DynamicSwapInstaller.install_model(transformer, device=gpu)
+        DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+
+    # 20250508 pftq: automatically set distilled cfg to 1 if cfg is used
+    if cfg > 1:
+        gs = 1
+    
     stream = AsyncStream()
 
-    # 20250506 pftq: Get FPS from input video
-    vr = decord.VideoReader(input_video)
-    fps = vr.get_avg_fps()
-
-    # 20250506 pftq: Pass FPS and num_clean_frames to worker
-    async_run(worker, input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, fps, num_clean_frames, vae_batch)
+    # 20250506 pftq: Pass num_clean_frames, vae_batch, etc
+    async_run(worker, input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames, vae_batch)
 
     output_filename = None
 
@@ -516,7 +538,7 @@ def process(input_video, prompt, n_prompt, seed, batch, resolution, total_second
             yield output_filename, gr.update(visible=True, value=preview), desc, html, gr.update(interactive=False), gr.update(interactive=True) # 20250506 pftq: Keep refreshing the video in case it got hidden when the tab was in the background
 
         if flag == 'end':
-            yield output_filename, gr.update(visible=False), gr.update(), '', gr.update(interactive=True), gr.update(interactive=False)
+            yield output_filename, gr.update(visible=False), desc+' Video complete.', '', gr.update(interactive=True), gr.update(interactive=False)
             break
 
 def end_process():
@@ -558,21 +580,27 @@ with block:
 
                 total_second_length = gr.Slider(label="Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
                 latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
-                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Changing this value is not recommended.')
+                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Increase for more quality, especially if using high non-distilled CFG.')
 
                 # 20250506 pftq: Renamed slider to Number of Context Frames and updated description
-                num_clean_frames = gr.Slider(label="Number of Context Frames", minimum=1, maximum=10, value=5, step=1, info="Retain more video details but increase memory use. Reduce to 2 if memory issues.")
+                num_clean_frames = gr.Slider(label="Number of Context Frames", minimum=2, maximum=10, value=5, step=1, info="Retain more video details but increase memory use. Reduce to 2 if memory issues.")
                 
                 # 20250506 pftq: Reduced default distilled guidance scale to improve adherence to input video
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=3.0, step=0.01, info='Prompt adherence at the cost of less details from the input video, but to a lesser extent than Context Frames.')
-                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=True, info='Use this instead of Distilled for more control + Negative Prompt (make sure Distilled set to 1). Doubles render time.')  # Should not change
+                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=1.0, step=0.01, visible=True, info='Use this instead of Distilled for more detail/control + Negative Prompt (make sure Distilled set to 1). Doubles render time.')  # Should not change
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True, info='Requires using normal CFG (undistilled) instead of Distilled (set Distilled=1 and CFG > 1).') 
 
                 gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
-                
-                vae_batch = gr.Slider(label="VAE Batch Size for Input Video", minimum=4, maximum=128, value=32, step=4, info="Reduce if running out of memory. Increase for better quality of frames from input video.")
+
+                default_vae = 32
+                if high_vram:
+                    default_vae = 128
+                elif free_mem_gb>=20:
+                    default_vae = 64
+                    
+                vae_batch = gr.Slider(label="VAE Batch Size for Input Video", minimum=4, maximum=256, value=default_vae, step=4, info="Reduce if running out of memory. Increase for better quality frames and fast motion.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
