@@ -634,9 +634,6 @@ with block:
                 resolution = gr.Number(label="Resolution (max width or height)", value=640, precision=0, visible=False)
 
                 total_second_length = gr.Slider(label="Additional Video Length to Generate (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
-
-                # 20250506 pftq: Renamed slider to Number of Context Frames and updated description
-                num_clean_frames = gr.Slider(label="Number of Context Frames", minimum=2, maximum=10, value=5, step=1, info="Retain more video details but increase memory use. Reduce to 2 if memory issues.")
                 
                 # 20250506 pftq: Reduced default distilled guidance scale to improve adherence to input video
                 gs = gr.Slider(label="Distilled CFG Scale", minimum=1.0, maximum=32.0, value=3.0, step=0.01, info='Prompt adherence at the cost of less details from the input video, but to a lesser extent than Context Frames.')
@@ -646,6 +643,9 @@ with block:
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True, info='Requires using normal CFG (undistilled) instead of Distilled (set Distilled=1 and CFG > 1).') 
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Increase for more quality, especially if using high non-distilled CFG.')
 
+                # 20250506 pftq: Renamed slider to Number of Context Frames and updated description
+                num_clean_frames = gr.Slider(label="Number of Context Frames", minimum=2, maximum=10, value=5, step=1, info="Retain more video details but increase memory use. Reduce to 2 if memory issues.")
+                
                 default_vae = 32
                 if high_vram:
                     default_vae = 128
