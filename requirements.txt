@@ -15,3 +15,4 @@ opencv-contrib-python
 safetensors
 
 decord==0.6.0
+imageio_ffmpeg==0.6.0
