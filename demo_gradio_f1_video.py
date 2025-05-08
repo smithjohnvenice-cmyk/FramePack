@@ -20,6 +20,11 @@ from tqdm import tqdm
 import pathlib
 # 20250506 pftq: for easier to read timestamp
 from datetime import datetime
+# 20250508 pftq: for saving prompt to mp4 comments metadata
+import imageio_ffmpeg
+import tempfile
+import shutil
+import subprocess
 
 from PIL import Image
 from diffusers import AutoencoderKLHunyuanVideo
@@ -245,6 +250,53 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, devi
         print(f"Error in video_encode: {str(e)}")
         raise
 
+# 20250508 pftq: for saving prompt to mp4 metadata comments
+def set_mp4_comments_imageio_ffmpeg(input_file, comments):
+    try:
+        # Get the path to the bundled FFmpeg binary from imageio-ffmpeg
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        # Check if input file exists
+        if not os.path.exists(input_file):
+            print(f"Error: Input file {input_file} does not exist")
+            return False
+            
+        # Create a temporary file path
+        temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+        
+        # FFmpeg command using the bundled binary
+        command = [
+            ffmpeg_path,                   # Use imageio-ffmpeg's FFmpeg
+            '-i', input_file,              # input file
+            '-metadata', f'comment={comments}',  # set comment metadata
+            '-c:v', 'copy',                # copy video stream without re-encoding
+            '-c:a', 'copy',                # copy audio stream without re-encoding
+            '-y',                          # overwrite output file if it exists
+            temp_file                      # temporary output file
+        ]
+        
+        # Run the FFmpeg command
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode == 0:
+            # Replace the original file with the modified one
+            shutil.move(temp_file, input_file)
+            print(f"Successfully added comments to {input_file}")
+            return True
+        else:
+            # Clean up temp file if FFmpeg fails
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            print(f"Error: FFmpeg failed with message:\n{result.stderr}")
+            return False
+            
+    except Exception as e:
+        # Clean up temp file in case of other errors
+        if 'temp_file' in locals() and os.path.exists(temp_file):
+            os.remove(temp_file)
+        print(f"Error saving prompt to video metadata, ffmpeg may be required: "+str(e))
+        return False
+
 # 20250506 pftq: Modified worker to accept video input and clean frame count
 @torch.no_grad()
 def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, no_resize, mp4_crf, num_clean_frames, vae_batch):
@@ -455,7 +507,7 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
                     history_pixels = vae_decode(real_history_latents, vae).cpu()
                 else:
                   section_latent_frames = latent_window_size * 2
-                  overlapped_frames = latent_window_size * 4 - 3
+                  overlapped_frames = min(latent_window_size * 4 - 3, history_pixels.shape[2])
                   
                   #if section_index == 0: 
                     #extra_latents = 1  # Add up to 2 extra latent frames for smoother overlap to initial video
@@ -473,9 +525,12 @@ def worker(input_video, prompt, n_prompt, seed, batch, resolution, total_second_
                 # 20250506 pftq: Use input video FPS for output
                 save_bcthw_as_mp4(history_pixels, output_filename, fps=fps, crf=mp4_crf)
                 print(f"Latest video saved: {output_filename}")
+                # 20250508 pftq: Save prompt to mp4 metadata comments
+                set_mp4_comments_imageio_ffmpeg(output_filename, f"Prompt: {prompt} | Negative Prompt: {n_prompt}");
+                print(f"Prompt saved to mp4 metadata comments: {output_filename}")
     
                 # 20250506 pftq: Clean up previous partial files
-                if previous_video is not None:
+                if previous_video is not None and os.path.exists(previous_video):
                     try:
                         os.remove(previous_video)
                         print(f"Previous partial video deleted: {previous_video}")
@@ -578,9 +633,7 @@ with block:
 
                 resolution = gr.Number(label="Resolution (max width or height)", value=640, precision=0, visible=False)
 
-                total_second_length = gr.Slider(label="Video Length (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
-                latent_window_size = gr.Slider(label="Latent Window Size", minimum=1, maximum=33, value=9, step=1, visible=False)  # Should not change
-                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Increase for more quality, especially if using high non-distilled CFG.')
+                total_second_length = gr.Slider(label="Additional Video Length to Generate (Seconds)", minimum=1, maximum=120, value=5, step=0.1)
 
                 # 20250506 pftq: Renamed slider to Number of Context Frames and updated description
                 num_clean_frames = gr.Slider(label="Number of Context Frames", minimum=2, maximum=10, value=5, step=1, info="Retain more video details but increase memory use. Reduce to 2 if memory issues.")
@@ -591,8 +644,7 @@ with block:
                 rs = gr.Slider(label="CFG Re-Scale", minimum=0.0, maximum=1.0, value=0.0, step=0.01, visible=False)  # Should not change
 
                 n_prompt = gr.Textbox(label="Negative Prompt", value="", visible=True, info='Requires using normal CFG (undistilled) instead of Distilled (set Distilled=1 and CFG > 1).') 
-
-                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
+                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Increase for more quality, especially if using high non-distilled CFG.')
 
                 default_vae = 32
                 if high_vram:
@@ -600,7 +652,11 @@ with block:
                 elif free_mem_gb>=20:
                     default_vae = 64
                     
-                vae_batch = gr.Slider(label="VAE Batch Size for Input Video", minimum=4, maximum=256, value=default_vae, step=4, info="Reduce if running out of memory. Increase for better quality frames and fast motion.")
+                vae_batch = gr.Slider(label="VAE Batch Size for Input Video", minimum=4, maximum=256, value=default_vae, step=4, info="Reduce if running out of memory. Increase for better quality frames during fast motion.")
+
+                latent_window_size = gr.Slider(label="Latent Window Size", minimum=9, maximum=33, value=9, step=1, visible=True, info='Generate more frames at a time (larger chunks). Less degradation and better blending but higher VRAM cost.') 
+
+                gpu_memory_preservation = gr.Slider(label="GPU Inference Preserved Memory (GB) (larger means slower)", minimum=6, maximum=128, value=6, step=0.1, info="Set this number to a larger value if you encounter OOM. Larger value causes slower speed.")
 
                 mp4_crf = gr.Slider(label="MP4 Compression", minimum=0, maximum=100, value=16, step=1, info="Lower means better quality. 0 is uncompressed. Change to 16 if you get black outputs. ")
 
