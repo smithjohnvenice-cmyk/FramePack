@@ -440,7 +440,7 @@ def worker(input_video, end_frame, end_frame_weight, prompt, n_prompt, seed, bat
             if batch > 1:
                 print(f"Beginning video {idx+1} of {batch} with seed {seed} ")
             
-            job_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")+f"_framepackf1-videoinput_{width}-{total_second_length}sec_seed-{seed}_steps-{steps}_distilled-{gs}_cfg-{cfg}"
+            job_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")+f"_framepack-videoinput-endframe_{width}-{total_second_length}sec_seed-{seed}_steps-{steps}_distilled-{gs}_cfg-{cfg}"
             
             stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Start sampling ...'))))
     
@@ -720,7 +720,7 @@ block = gr.Blocks(css=css).queue(
 )
 with block:
     # 20250506 pftq: Updated title to reflect video input functionality
-    gr.Markdown('# Framepack F1 with Video Input (Video Extension) + End Frame')
+    gr.Markdown('# Framepack with Video Input (Video Extension) + End Frame')
     with gr.Row():
         with gr.Column():
         
