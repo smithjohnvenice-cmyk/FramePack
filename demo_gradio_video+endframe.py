@@ -763,7 +763,7 @@ with block:
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Expensive. Increase for more quality, especially if using high non-distilled CFG.')
                 
                 # 20250506 pftq: Renamed slider to Number of Context Frames and updated description
-                num_clean_frames = gr.Slider(label="Number of Context Frames (Adherence to Video)", minimum=2, maximum=10, value=2, step=1, info="Expensive. Retain more video details. Reduce if memory issues or if motion too restricted (jumpcut, ignoring prompt, still image).")
+                num_clean_frames = gr.Slider(label="Number of Context Frames (Adherence to Video)", minimum=2, maximum=10, value=5, step=1, info="Expensive. Retain more video details. Reduce if memory issues or motion too restricted (jumpcut, ignoring prompt, still).")
 
                 default_vae = 32
                 if high_vram:
