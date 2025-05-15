@@ -542,6 +542,7 @@ def worker(input_video, end_frame, end_frame_weight, prompt, n_prompt, seed, bat
                     
                     # 20250511 pftq: Use end_latent only
                     if is_end_of_video:
+                        clean_latents_pre = end_latent.to(history_latents)[:, :, :1, :, :]
                         clean_latents_post = end_latent.to(history_latents)[:, :, :1, :, :]  # Ensure single frame
                     
                 # 20250511 pftq: Pad clean_latents_pre to match clean_latent_pre_frames if needed
@@ -729,7 +730,7 @@ with block:
                 input_video = gr.Video(sources='upload', label="Input Video", height=320)
                 with gr.Column():
                   # 20250507 pftq: Added end_frame + weight
-                  end_frame = gr.Image(sources='upload', type="numpy", label="End Frame (Optional) - Reduce context frames if very different from input video or it'll jumpcut", height=320)
+                  end_frame = gr.Image(sources='upload', type="numpy", label="End Frame (Optional) - Reduce context frames if very different from input video or if it is jumpcutting/slowing to still image.", height=320)
                   end_frame_weight = gr.Slider(label="End Frame Weight", minimum=0.0, maximum=1.0, value=1.0, step=0.01, info='Reduce to treat more as a reference image.', visible=False) # no effect
                 
             prompt = gr.Textbox(label="Prompt", value='')
@@ -763,7 +764,7 @@ with block:
                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1, info='Expensive. Increase for more quality, especially if using high non-distilled CFG.')
                 
                 # 20250506 pftq: Renamed slider to Number of Context Frames and updated description
-                num_clean_frames = gr.Slider(label="Number of Context Frames (Adherence to Video)", minimum=2, maximum=10, value=5, step=1, info="Expensive. Retain more video details. Reduce if memory issues or if too stuck to input video (jumpcut to end frame, ignoring prompt).")
+                num_clean_frames = gr.Slider(label="Number of Context Frames (Adherence to Video)", minimum=2, maximum=10, value=2, step=1, info="Expensive. Retain more video details. Reduce if memory issues or if motion too restricted (jumpcut, ignoring prompt, still image).")
 
                 default_vae = 32
                 if high_vram:
