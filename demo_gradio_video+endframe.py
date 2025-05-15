@@ -542,7 +542,6 @@ def worker(input_video, end_frame, end_frame_weight, prompt, n_prompt, seed, bat
                     
                     # 20250511 pftq: Use end_latent only
                     if is_end_of_video:
-                        clean_latents_pre = end_latent.to(history_latents)[:, :, :1, :, :]
                         clean_latents_post = end_latent.to(history_latents)[:, :, :1, :, :]  # Ensure single frame
                     
                 # 20250511 pftq: Pad clean_latents_pre to match clean_latent_pre_frames if needed
