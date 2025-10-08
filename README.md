@@ -20,7 +20,9 @@ FramePack can be trained with a much larger batch size, similar to the batch siz
 
 # News
 
-**2025 May 06:** FramePack-F1 with Video Input (Video Extension) - extend an existing video while preserving motion continuity. Try by running "python demo_gradio_f1_video.py" and there's also "demo_gradio_video+endframe.py" for both video input and endframe (but generation will be backwards end to start).
+**2025 July 14:** Some pure text2video anti-drifting stress-test results of FramePack-P1 are uploaded [here,](https://lllyasviel.github.io/frame_pack_gitpage/p1/#text-to-video-stress-tests) using common prompts without any reference images.
+
+**2025 June 26:** Some results of FramePack-P1 are uploaded [here.](https://lllyasviel.github.io/frame_pack_gitpage/p1) The FramePack-P1 will be the next version of FramePack with two designs: Planned Anti-Drifting and History Discretization.
 
 **2025 May 03:** The FramePack-F1 is released. [Try it here.](https://github.com/lllyasviel/FramePack/discussions/459)
 
@@ -68,17 +70,6 @@ We recommend having an independent Python 3.10.
 To start the GUI, run:
 
     python demo_gradio.py
-
-For F1 version (forward generation), run:
-
-    python demo_gradio_f1.py
-
-For version with video input (video extension), run:
-
-    python demo_gradio_f1_video.py
-
-For video input (video extension) + endframe, run:
-    python demo_gradio_video+endframe.py
 
 Note that it supports `--share`, `--port`, `--server`, and so on.
 
